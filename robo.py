@@ -172,8 +172,10 @@ def buscar():
     cr = escolher(c, ["razao_social"], t)
     cc = escolher(c, ["capital_social"], t)
     cp = escolher(c, ["porte"], t)
+    cnj = escolher(c, ["natureza_juridica"], t, obrigatoria=False)
+    sel_nj = f", {cnj} AS natureza" if cnj else ", '' AS natureza"
     empresas = {}
-    for r in consulta(bq, f"SELECT cnpj_basico, {cr} AS razao, {cc} AS capital, {cp} AS porte FROM `{t}` "
+    for r in consulta(bq, f"SELECT cnpj_basico, {cr} AS razao, {cc} AS capital, {cp} AS porte{sel_nj} FROM `{t}` "
                           f"WHERE {filtro} AND cnpj_basico IN UNNEST(@b)", [p_b]):
         porte = txt(r.porte).upper()
         porte = {"1": "01", "3": "03", "5": "05"}.get(zeros(porte), porte)
@@ -184,7 +186,7 @@ def buscar():
         elif "DEMAIS" in porte:
             porte = "05"
         cap = txt(r.capital).replace(",", ".") or "0"
-        empresas[txt(r.cnpj_basico)] = [txt(r.cnpj_basico), txt(r.razao), "", "", cap, porte]
+        empresas[txt(r.cnpj_basico)] = [txt(r.cnpj_basico), txt(r.razao), txt(r.natureza), "", cap, porte]
 
     ETAPA = "simples"
     t = f"{DS}.simples"
@@ -241,7 +243,7 @@ def classificar(cnae, e_simples, e_mei, porte, capital, ja_doou=False):
     if cnae in TESE1_ICMS_ST:
         teses.append(("ICMS-ST", TESE1_ICMS_ST[cnae], False))
     divisao = int(cnae[:2]) if cnae[:2].isdigit() else 0
-    sinal_real = porte == "05" or capital >= 1_000_000
+    sinal_real = capital >= 1_000_000 or (porte == "05" and capital >= 200_000)
     if 10 <= divisao <= 33 and sinal_real:
         teses.append(("Insumos", "A", False))
     elif cnae in TESE3_SERVICOS_MANUAL:
@@ -262,10 +264,10 @@ def incentivo(cnae, e_simples, e_mei, porte, capital, ja_doou=False):
         return ("Leis de Incentivo", "A", False)
     if e_simples or e_mei:
         return None
-    if not (porte == "05" or capital >= CAPITAL_MIN_INCENTIVO):
+    if capital < CAPITAL_MIN_INCENTIVO:
         return None
     divisao = int(cnae[:2]) if cnae[:2].isdigit() else 0
-    federal = porte == "05" or capital >= 1_000_000
+    federal = capital >= 1_000_000
     icms = 5 <= divisao <= 33 or 45 <= divisao <= 47
     if federal and icms:
         return ("Leis de Incentivo", "A", False)
@@ -282,17 +284,23 @@ def _salic_url(link):
 
 
 def _anos(obj):
+    """Procura datas em qualquer campo (aaaa-mm-dd, dd/mm/aaaa ou ano solto em campo de data)."""
+    import re as _re
     anos = []
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(v, str) and ("data" in k.lower() or "ano" in k.lower()):
-                import re as _re
-                m = _re.search(r"(19|20)\d{2}", v)
-                if m:
-                    anos.append(int(m.group(0)))
-            elif isinstance(v, (int, float)) and k.lower() in ("ano", "ano_projeto"):
-                anos.append(int(v))
-    return anos
+            if isinstance(v, (dict, list)):
+                anos += _anos(v)
+                continue
+            texto = str(v)
+            for m in _re.finditer(r"\b((?:19|20)\d{2})-\d{2}-\d{2}|\b\d{2}/\d{2}/((?:19|20)\d{2})\b", texto):
+                anos.append(int(m.group(1) or m.group(2)))
+            if ("data" in k.lower() or "ano" in k.lower()) and _re.fullmatch(r"(19|20)\d{2}", texto.strip()):
+                anos.append(int(texto.strip()))
+    elif isinstance(obj, list):
+        for x in obj:
+            anos += _anos(x)
+    return [a for a in anos if 1990 <= a <= date.today().year]
 
 
 def historico_rouanet(cidades_uf):
@@ -314,7 +322,7 @@ def historico_rouanet(cidades_uf):
                     try:
                         d = requests.get(link, params={"limit": 100}, headers={"Accept": "application/json", **HEADERS},
                                          timeout=60).json()
-                        doacoes = d.get("_embedded", {}).get("doacoes", [])
+                        doacoes = d.get("_embedded", {}).get("doacoes") or d.get("doacoes") or d
                         anos = [a for doa in doacoes for a in _anos(doa)]
                         info["ultima"] = max(anos) if anos else 0
                     except Exception as e:
@@ -357,6 +365,9 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
                 capital = float(emp[4] if len(emp) > 4 else "0")
             except ValueError:
                 capital = 0.0
+            natureza = "".join(ch for ch in (emp[2] if len(emp) > 2 else "") if ch.isdigit())
+            if natureza and not natureza.startswith("2"):
+                continue  # igrejas, associações, partidos, produtor rural pessoa física etc.
             e_simples, e_mei = simples.get(cnpj[:8], (False, False))
             anos = idade(l[10])
             if anos < IDADE_MINIMA_ANOS:
@@ -368,7 +379,10 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
             pontos, prioridade = pontuar(teses, anos, capital, porte)
             st_inc = ""
             if h:
-                st_inc = "doador" if h["ultima"] >= date.today().year - 1 else "parou"
+                if not h["ultima"]:
+                    st_inc = "doou"          # doou, mas o ano não veio na base
+                else:
+                    st_inc = "doador" if h["ultima"] >= date.today().year - 1 else "parou"
                 pontos = min(100, pontos + (10 if st_inc == "parou" else 5))
                 prioridade = "Alta" if pontos >= 60 else prioridade
             fone = lambda ddd, tel: (ddd.strip() + tel.strip()) if tel.strip() else ""
