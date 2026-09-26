@@ -20,7 +20,8 @@ CIDADES = ["Votuporanga"]          # nomes das cidades, como no IBGE
 UF = "SP"
 IDADE_MINIMA_ANOS = 2
 BAIXAR_SOCIOS = True
-SO_MATRIZ = True                   # ignora filiais de redes de fora (ex.: lojas de rede nacional)               # False deixa o robô mais rápido, sem nome do sócio
+SO_MATRIZ = True
+CONSULTAR_ROUANET = True           # histórico de doações pela base aberta do SALIC                   # ignora filiais de redes de fora (ex.: lojas de rede nacional)               # False deixa o robô mais rápido, sem nome do sócio
 
 # Força por CNAE em cada tese: A = Alta, M = Média, B = Baixa, R = revisão manual
 TESE1_ICMS_ST = {  # fora do Simples
@@ -48,6 +49,8 @@ TESE4_ISS = {  # fora do Simples; tese aguardando STF
 PONTOS_FORCA = {"A": 40, "M": 25, "B": 10, "R": 10}
 _NOMES = {}
 BASE = ""
+HIST = {}
+HEADERS = {"User-Agent": "Mozilla/5.0 (radar-tributario)"}
 ETAPA = "início"
 DS = "basedosdados.br_me_cnpj"
 LIMITE_BYTES = 300 * 10**9   # trava de segurança por consulta (bem abaixo do 1 TB grátis)
@@ -228,6 +231,9 @@ def classificar(cnae, e_simples, e_mei, porte, capital):
     teses = []
     if e_mei:
         return teses
+    inc = incentivo(cnae, e_simples, e_mei, porte, capital)
+    if inc:
+        teses.append(inc)
     if e_simples:
         if cnae in TESE2_SIMPLES:
             teses.append(("Monofásico/ST Simples", TESE2_SIMPLES[cnae], False))
@@ -243,6 +249,74 @@ def classificar(cnae, e_simples, e_mei, porte, capital):
     if cnae in TESE4_ISS:
         teses.append(("ISS (aguardando STF)", TESE4_ISS[cnae], True))
     return teses
+
+
+def incentivo(cnae, e_simples, e_mei, porte, capital):
+    """Leis de incentivo: federais (IR) pedem lucro real; estaduais de SP (ICMS) pedem
+    contribuinte de ICMS fora do Simples (comércio e indústria)."""
+    if e_simples or e_mei:
+        return None
+    divisao = int(cnae[:2]) if cnae[:2].isdigit() else 0
+    federal = porte == "05" or capital >= 1_000_000
+    icms = 5 <= divisao <= 33 or 45 <= divisao <= 47
+    if federal and icms:
+        return ("Leis de Incentivo", "A", False)
+    if federal or icms:
+        return ("Leis de Incentivo", "M", False)
+    return None
+
+
+SALIC = "https://api.salic.cultura.gov.br/api/v1/incentivadores"
+
+
+def _salic_url(link):
+    return link.replace("http://localhost:8001", "https://api.salic.cultura.gov.br") if link else ""
+
+
+def _anos(obj):
+    anos = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str) and ("data" in k.lower() or "ano" in k.lower()):
+                import re as _re
+                m = _re.search(r"(19|20)\d{2}", v)
+                if m:
+                    anos.append(int(m.group(0)))
+            elif isinstance(v, (int, float)) and k.lower() in ("ano", "ano_projeto"):
+                anos.append(int(v))
+    return anos
+
+
+def historico_rouanet(cidades_uf):
+    """Devolve {cnpj: {"total": x, "ultima": ano}} dos incentivadores das cidades."""
+    hist = {}
+    for cidade in cidades_uf:
+        offset = 0
+        while True:
+            r = requests.get(SALIC, params={"municipio": cidade, "UF": UF, "tipo_pessoa": "juridica",
+                                            "limit": 100, "offset": offset},
+                             headers={"Accept": "application/json", **HEADERS}, timeout=60)
+            r.raise_for_status()
+            lista = r.json().get("_embedded", {}).get("incentivadores", [])
+            for inc in lista:
+                cnpj = "".join(ch for ch in str(inc.get("cgccpf", "")) if ch.isdigit()).zfill(14)
+                info = {"total": float(inc.get("total_doado") or 0), "ultima": 0}
+                link = _salic_url(inc.get("_links", {}).get("doacoes", ""))
+                if link:
+                    try:
+                        d = requests.get(link, params={"limit": 100}, headers={"Accept": "application/json", **HEADERS},
+                                         timeout=60).json()
+                        doacoes = d.get("_embedded", {}).get("doacoes", [])
+                        anos = [a for doa in doacoes for a in _anos(doa)]
+                        info["ultima"] = max(anos) if anos else 0
+                    except Exception as e:
+                        log("  doações de", cnpj, "falharam:", e)
+                hist[cnpj] = info
+            if len(lista) < 100:
+                break
+            offset += 100
+            time.sleep(0.5)
+    return hist
 
 
 def pontuar(teses, anos, capital, porte):
@@ -262,7 +336,8 @@ def pontuar(teses, anos, capital, porte):
 def montar_csv(estab, empresas, simples, socios, cnaes, saida):
     campos = ["cnpj", "razao_social", "nome_fantasia", "municipio", "uf", "bairro", "logradouro",
               "numero", "cep", "telefone1", "telefone2", "email", "cnae_principal", "cnae_descricao",
-              "data_inicio", "capital_social", "socio_principal", "teses", "prioridade", "pontuacao", "base"]
+              "data_inicio", "capital_social", "socio_principal", "teses", "prioridade", "pontuacao", "base",
+              "incentivo_status", "incentivo_ultima", "incentivo_total"]
     total = 0
     with open(saida, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=campos)
@@ -282,6 +357,12 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
             if not teses:
                 continue
             pontos, prioridade = pontuar(teses, anos, capital, porte)
+            h = HIST.get(cnpj) or next((v for k, v in HIST.items() if k[:8] == cnpj[:8]), None)
+            st_inc = ""
+            if h:
+                st_inc = "doador" if h["ultima"] >= date.today().year - 1 else "parou"
+                pontos = min(100, pontos + (10 if st_inc == "parou" else 5))
+                prioridade = "Alta" if pontos >= 60 else prioridade
             fone = lambda ddd, tel: (ddd.strip() + tel.strip()) if tel.strip() else ""
             w.writerow({
                 "cnpj": cnpj, "razao_social": emp[1] if len(emp) > 1 else "",
@@ -294,6 +375,8 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
                 "data_inicio": f"{l[10][:4]}-{l[10][4:6]}-{l[10][6:8]}" if len(l[10]) == 8 else "",
                 "capital_social": f"{capital:.2f}", "socio_principal": socios.get(cnpj[:8], ""),
                 "teses": "|".join(t for t, _, _ in teses), "prioridade": prioridade, "pontuacao": pontos, "base": BASE,
+                "incentivo_status": st_inc, "incentivo_ultima": (h or {}).get("ultima") or "",
+                "incentivo_total": f"{(h or {}).get('total', 0):.2f}" if h else "",
             })
             total += 1
     return total
@@ -335,12 +418,22 @@ def main():
     global ETAPA, BASE
     periodo, estab, empresas, simples, socios, cnaes = buscar()
     BASE = periodo
+    global HIST
+    aviso_rouanet = ""
+    if CONSULTAR_ROUANET:
+        ETAPA = "histórico da Lei Rouanet"
+        try:
+            HIST = historico_rouanet(CIDADES)
+            log("Incentivadores Rouanet encontrados:", len(HIST))
+        except Exception as e:
+            aviso_rouanet = " (não consegui consultar a Lei Rouanet hoje)"
+            log("Rouanet indisponível:", e)
     ETAPA = "montagem da planilha"
     saida = f"empresas-{periodo}.csv"
     total = montar_csv(estab, empresas, simples, socios, cnaes, saida)
     log("Empresas no CSV:", total)
     enviar_telegram(saida, f"📊 Radar Tributário · base {periodo} · {total} empresas em "
-                           f"{', '.join(CIDADES)}. Importe este arquivo no painel.")
+                           f"{', '.join(CIDADES)}{aviso_rouanet}. Importe este arquivo no painel.")
 
 
 if __name__ == "__main__":
@@ -349,4 +442,5 @@ if __name__ == "__main__":
     except Exception as e:
         avisar(f"⚠️ Radar Tributário: parou na etapa \"{ETAPA}\": {str(e)[:3000]}")
         raise
+
 
