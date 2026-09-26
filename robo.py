@@ -226,12 +226,12 @@ def idade(data_inicio):
         return 0
 
 
-def classificar(cnae, e_simples, e_mei, porte, capital):
+def classificar(cnae, e_simples, e_mei, porte, capital, ja_doou=False):
     """Devolve lista de (tese, força, limita_a_baixa)."""
     teses = []
     if e_mei:
         return teses
-    inc = incentivo(cnae, e_simples, e_mei, porte, capital)
+    inc = incentivo(cnae, e_simples, e_mei, porte, capital, ja_doou)
     if inc:
         teses.append(inc)
     if e_simples:
@@ -251,10 +251,18 @@ def classificar(cnae, e_simples, e_mei, porte, capital):
     return teses
 
 
-def incentivo(cnae, e_simples, e_mei, porte, capital):
+CAPITAL_MIN_INCENTIVO = 500_000     # abaixo disso, a doação possível é pequena demais
+
+
+def incentivo(cnae, e_simples, e_mei, porte, capital, ja_doou=False):
     """Leis de incentivo: federais (IR) pedem lucro real; estaduais de SP (ICMS) pedem
-    contribuinte de ICMS fora do Simples (comércio e indústria)."""
+    contribuinte de ICMS fora do Simples (comércio e indústria). Só entra quem tem
+    porte para doar de verdade, ou quem já doou alguma vez."""
+    if ja_doou:
+        return ("Leis de Incentivo", "A", False)
     if e_simples or e_mei:
+        return None
+    if not (porte == "05" or capital >= CAPITAL_MIN_INCENTIVO):
         return None
     divisao = int(cnae[:2]) if cnae[:2].isdigit() else 0
     federal = porte == "05" or capital >= 1_000_000
@@ -353,11 +361,11 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
             anos = idade(l[10])
             if anos < IDADE_MINIMA_ANOS:
                 continue
-            teses = classificar(l[11], e_simples, e_mei, porte, capital)
+            h = HIST.get(cnpj) or next((v for k, v in HIST.items() if k[:8] == cnpj[:8]), None)
+            teses = classificar(l[11], e_simples, e_mei, porte, capital, ja_doou=bool(h))
             if not teses:
                 continue
             pontos, prioridade = pontuar(teses, anos, capital, porte)
-            h = HIST.get(cnpj) or next((v for k, v in HIST.items() if k[:8] == cnpj[:8]), None)
             st_inc = ""
             if h:
                 st_inc = "doador" if h["ultima"] >= date.today().year - 1 else "parou"
@@ -442,5 +450,3 @@ if __name__ == "__main__":
     except Exception as e:
         avisar(f"⚠️ Radar Tributário: parou na etapa \"{ETAPA}\": {str(e)[:3000]}")
         raise
-
-
