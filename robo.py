@@ -1,23 +1,22 @@
 """
 Radar Tributário: robô de abastecimento do painel.
-Baixa a base aberta do CNPJ (Receita Federal), filtra as cidades escolhidas,
+Consulta a base aberta do CNPJ (Receita Federal) na cópia pública da Base dos Dados
+no Google BigQuery, filtra as cidades escolhidas,
 aplica as teses e a pontuação e manda um CSV pronto para importar no painel,
 pelo Telegram.
 """
 import csv
-import io
+import json
 import os
-import re
-import sys
 import time
-import zipfile
 from datetime import date
-from xml.etree import ElementTree
 
 import requests
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # ================== CONFIGURAÇÃO (pode editar) ==================
-CIDADES = ["VOTUPORANGA"]          # nomes como a Receita escreve, sem acento
+CIDADES = ["Votuporanga"]          # nomes das cidades, como no IBGE
 UF = "SP"
 IDADE_MINIMA_ANOS = 2
 BAIXAR_SOCIOS = True               # False deixa o robô mais rápido, sem nome do sócio
@@ -45,161 +44,169 @@ TESE4_ISS = {  # fora do Simples; tese aguardando STF
 }
 # ================================================================
 
-SHARE_TOKEN = "YggdBLfdninEJX9"
-DAV = "https://arquivos.receitafederal.gov.br/public.php/webdav/"
-FILES = "https://arquivos.receitafederal.gov.br/public.php/dav/files/%s/%s/%s"
-PASTA = "dados"
-HEADERS = {"User-Agent": "Mozilla/5.0 (radar-tributario)"}
 PONTOS_FORCA = {"A": 40, "M": 25, "B": 10, "R": 10}
 _NOMES = {}
+ETAPA = "início"
+DS = "basedosdados.br_me_cnpj"
+LIMITE_BYTES = 300 * 10**9   # trava de segurança por consulta (bem abaixo do 1 TB grátis)
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-ETAPA = "início"
-ARQUIVOS_PADRAO = (["Cnaes.zip", "Municipios.zip", "Simples.zip"]
-                   + [f"{p}{i}.zip" for p in ("Empresas", "Estabelecimentos", "Socios") for i in range(10)])
+def cliente():
+    info = json.loads(os.environ["GCP_KEY"])
+    cred = service_account.Credentials.from_service_account_info(info)
+    return bigquery.Client(credentials=cred, project=info["project_id"])
 
 
-def propfind(url):
-    for tentativa in range(6):
-        try:
-            r = requests.request("PROPFIND", url, auth=(SHARE_TOKEN, ""),
-                                 headers={"Depth": "1", **HEADERS}, timeout=90)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            log(f"  listagem falhou ({e}); tentativa {tentativa + 1}")
-            time.sleep(20 * (tentativa + 1))
-    raise RuntimeError("a Receita não respondeu à listagem de arquivos")
+def colunas(bq, tabela):
+    return [c.name for c in bq.get_table(tabela).schema]
 
 
-def mes_sem_listagem():
-    """Plano B: tenta o mês atual e os dois anteriores, sem listar a pasta."""
-    hoje = date.today()
-    for volta in range(3):
-        a, m = hoje.year, hoje.month - volta
-        while m <= 0:
-            a, m = a - 1, m + 12
-        mes = f"{a}-{m:02d}"
-        try:
-            r = requests.get(FILES % (SHARE_TOKEN, mes, "Cnaes.zip"), headers=HEADERS,
-                             stream=True, timeout=(30, 90))
-            if r.ok:
-                r.close()
-                return mes, list(ARQUIVOS_PADRAO)
-        except Exception as e:
-            log(f"  teste do mês {mes} falhou ({e})")
-    raise RuntimeError("não encontrei a pasta do mês na Receita")
+def escolher(cols, candidatos, tabela, obrigatoria=True):
+    for c in candidatos:
+        if c in cols:
+            return c
+    if obrigatoria:
+        raise RuntimeError(f"coluna {candidatos[0]} não existe em {tabela}. Colunas: {', '.join(cols)}")
+    return None
 
 
-def ultimo_mes_e_arquivos():
-    try:
-        return _ultimo_mes_e_arquivos()
-    except Exception as e:
-        log("Listagem falhou, usando plano B:", e)
-        return mes_sem_listagem()
+def consulta(bq, sql, params=()):
+    cfg = bigquery.QueryJobConfig(query_parameters=list(params), maximum_bytes_billed=LIMITE_BYTES)
+    return list(bq.query(sql, job_config=cfg).result())
 
 
-def _ultimo_mes_e_arquivos():
-    ns = {"d": "DAV:"}
-    r = propfind(DAV)
-    meses = sorted(re.search(r"(\d{4}-\d{2})/?$", e.find("d:href", ns).text).group(1)
-                   for e in ElementTree.fromstring(r.content).findall("d:response", ns)
-                   if re.search(r"(\d{4}-\d{2})/?$", e.find("d:href", ns).text))
-    mes = meses[-1]
-    r = propfind(DAV + mes + "/")
-    arqs = [re.search(r"/([^/]+\.zip)$", e.find("d:href", ns).text, re.I).group(1)
-            for e in ElementTree.fromstring(r.content).findall("d:response", ns)
-            if re.search(r"/([^/]+\.zip)$", e.find("d:href", ns).text, re.I)]
-    return mes, arqs
+def ultimo_periodo(bq, tabela, cols):
+    if "ano" in cols and "mes" in cols:
+        r = consulta(bq, f"SELECT ano, mes FROM `{tabela}` GROUP BY 1, 2 ORDER BY 1 DESC, 2 DESC LIMIT 1")
+        return f"ano = {int(r[0].ano)} AND mes = {int(r[0].mes)}", f"{int(r[0].ano)}-{int(r[0].mes):02d}"
+    if "data" in cols:
+        r = consulta(bq, f"SELECT MAX(data) AS d FROM `{tabela}`")
+        return f"data = '{r[0].d}'", str(r[0].d)[:7]
+    return "TRUE", "atual"
 
 
-def baixar(mes, nome):
+def txt(v):
+    return "" if v is None else str(v).strip()
+
+
+def sim(v):
+    return txt(v).upper() in ("S", "SIM", "1", "TRUE", "T")
+
+
+def zeros(v):
+    return txt(v).lstrip("0")
+
+
+def buscar():
     global ETAPA
-    ETAPA = f"download de {nome}"
-    os.makedirs(PASTA, exist_ok=True)
-    destino = os.path.join(PASTA, nome)
-    url = FILES % (SHARE_TOKEN, mes, nome)
-    for tentativa in range(8):
-        try:
-            with requests.get(url, headers=HEADERS, stream=True, timeout=(30, 300)) as r:
-                r.raise_for_status()
-                with open(destino, "wb") as f:
-                    for bloco in r.iter_content(1 << 20):
-                        f.write(bloco)
-            zipfile.ZipFile(destino).testzip()
-            return destino
-        except Exception as e:
-            log(f"  falha ao baixar {nome} ({e}); tentando de novo")
-            time.sleep(min(30 * (tentativa + 1), 180))
-    raise RuntimeError(f"Não consegui baixar {nome}")
+    bq = cliente()
 
+    ETAPA = "códigos das cidades"
+    mun = consulta(bq, """SELECT id_municipio, nome FROM `basedosdados.br_bd_diretorios_brasil.municipio`
+                          WHERE sigla_uf = @uf AND nome IN UNNEST(@nomes)""",
+                   [bigquery.ScalarQueryParameter("uf", "STRING", UF),
+                    bigquery.ArrayQueryParameter("nomes", "STRING", CIDADES)])
+    ids = [txt(r.id_municipio) for r in mun]
+    for r in mun:
+        _NOMES[txt(r.id_municipio)] = txt(r.nome)
+    if not ids:
+        raise RuntimeError("nenhuma cidade encontrada; confira os nomes em CIDADES")
+    log("Cidades:", _NOMES)
 
-def linhas(caminho):
-    """Lê o CSV (latin-1, ';') de dentro do zip, linha a linha."""
-    with zipfile.ZipFile(caminho) as z:
-        with z.open(z.namelist()[0]) as f:
-            texto = io.TextIOWrapper(f, encoding="latin-1", newline="")
-            yield from csv.reader(texto, delimiter=";", quotechar='"')
-
-
-def processar(mes, arqs, baixar_fn=baixar):
-    grupo = lambda prefixo: sorted(a for a in arqs if a.lower().startswith(prefixo))
-
-    # 1. Códigos de município e descrições de CNAE
-    cod_cidades = set()
-    for l in linhas(baixar_fn(mes, grupo("municipios")[0])):
-        if len(l) >= 2 and l[1].strip().upper() in CIDADES:
-            cod_cidades.add(l[0].strip())
-            _NOMES[l[0].strip()] = l[1].strip().title()
-    cnaes = {l[0].strip(): l[1].strip() for l in linhas(baixar_fn(mes, grupo("cnaes")[0])) if len(l) >= 2}
-    log("Municípios encontrados:", cod_cidades)
-    if not cod_cidades:
-        raise RuntimeError("Nenhuma cidade encontrada. Confira os nomes em CIDADES.")
-
-    # 2. Estabelecimentos ativos das cidades
+    ETAPA = "estabelecimentos"
+    t = f"{DS}.estabelecimentos"
+    c = colunas(bq, t)
+    filtro, periodo = ultimo_periodo(bq, t, c)
+    campos = {k: escolher(c, v, t, obr) for k, v, obr in [
+        ("cnpj", ["cnpj"], True), ("fantasia", ["nome_fantasia"], False),
+        ("situacao", ["situacao_cadastral"], True), ("inicio", ["data_inicio_atividade"], True),
+        ("cnae", ["cnae_fiscal_principal", "cnae_principal"], True), ("tipo", ["tipo_logradouro"], False),
+        ("logradouro", ["logradouro"], False), ("numero", ["numero"], False), ("bairro", ["bairro"], False),
+        ("cep", ["cep"], False), ("ddd1", ["ddd_1", "ddd1"], False), ("tel1", ["telefone_1", "telefone1"], False),
+        ("ddd2", ["ddd_2", "ddd2"], False), ("tel2", ["telefone_2", "telefone2"], False),
+        ("email", ["email"], False), ("municipio", ["id_municipio"], True), ("uf", ["sigla_uf"], True)]}
+    sel = ", ".join(f"{v} AS {k}" for k, v in campos.items() if v)
+    linhas = consulta(bq, f"SELECT {sel} FROM `{t}` WHERE {filtro} AND {campos['uf']} = @uf "
+                          f"AND CAST({campos['municipio']} AS STRING) IN UNNEST(@ids)",
+                      [bigquery.ScalarQueryParameter("uf", "STRING", UF),
+                       bigquery.ArrayQueryParameter("ids", "STRING", ids)])
     estab = {}
-    for nome in grupo("estabelecimentos"):
-        caminho = baixar_fn(mes, nome)
-        for l in linhas(caminho):
-            if len(l) < 28 or l[19] != UF or l[20] not in cod_cidades or l[5] != "02":
-                continue
-            estab[l[0] + l[1] + l[2]] = l
-        os.remove(caminho)
-        log(f"{nome}: {len(estab)} estabelecimentos ativos até agora")
-    basicos = {k[:8] for k in estab}
+    for r in linhas:
+        g = lambda k: txt(getattr(r, k, None)) if campos.get(k) else ""
+        situ = g("situacao").upper()
+        if zeros(situ) != "2" and "ATIVA" not in situ:
+            continue
+        cnpj = "".join(ch for ch in g("cnpj") if ch.isdigit()).zfill(14)
+        l = [""] * 30
+        l[0], l[1], l[2] = cnpj[:8], cnpj[8:12], cnpj[12:]
+        l[4] = g("fantasia")
+        l[10] = g("inicio").replace("-", "")[:8]
+        l[11] = "".join(ch for ch in g("cnae") if ch.isdigit()).zfill(7)
+        l[13], l[14], l[15], l[17], l[18] = g("tipo"), g("logradouro"), g("numero"), g("bairro"), g("cep")
+        l[19], l[20] = UF, g("municipio")
+        l[21], l[22], l[23], l[24], l[27] = g("ddd1"), g("tel1"), g("ddd2"), g("tel2"), g("email")
+        estab[cnpj] = l
+    basicos = sorted({k[:8] for k in estab})
+    log("Estabelecimentos ativos:", len(estab), "período", periodo)
+    if not basicos:
+        raise RuntimeError(f"nenhuma empresa ativa encontrada (período {periodo})")
+    p_b = bigquery.ArrayQueryParameter("b", "STRING", basicos)
 
-    # 3. Empresas (razão social, capital, porte)
+    ETAPA = "empresas"
+    t = f"{DS}.empresas"
+    c = colunas(bq, t)
+    filtro, _ = ultimo_periodo(bq, t, c)
+    cr = escolher(c, ["razao_social"], t)
+    cc = escolher(c, ["capital_social"], t)
+    cp = escolher(c, ["porte"], t)
     empresas = {}
-    for nome in grupo("empresas"):
-        caminho = baixar_fn(mes, nome)
-        for l in linhas(caminho):
-            if len(l) >= 6 and l[0] in basicos:
-                empresas[l[0]] = l
-        os.remove(caminho)
-    log("Empresas lidas:", len(empresas))
+    for r in consulta(bq, f"SELECT cnpj_basico, {cr} AS razao, {cc} AS capital, {cp} AS porte FROM `{t}` "
+                          f"WHERE {filtro} AND cnpj_basico IN UNNEST(@b)", [p_b]):
+        porte = txt(r.porte).upper()
+        porte = {"1": "01", "3": "03", "5": "05"}.get(zeros(porte), porte)
+        if "MICRO" in porte:
+            porte = "01"
+        elif "PEQUENO" in porte:
+            porte = "03"
+        elif "DEMAIS" in porte:
+            porte = "05"
+        cap = txt(r.capital).replace(",", ".") or "0"
+        empresas[txt(r.cnpj_basico)] = [txt(r.cnpj_basico), txt(r.razao), "", "", cap, porte]
 
-    # 4. Simples / MEI
-    simples = {}
-    caminho = baixar_fn(mes, grupo("simples")[0])
-    for l in linhas(caminho):
-        if len(l) >= 5 and l[0] in basicos:
-            simples[l[0]] = (l[1] == "S", l[4] == "S")
-    os.remove(caminho)
+    ETAPA = "simples"
+    t = f"{DS}.simples"
+    c = colunas(bq, t)
+    filtro, _ = ultimo_periodo(bq, t, c)
+    cs = escolher(c, ["opcao_simples"], t)
+    cm = escolher(c, ["opcao_mei"], t)
+    simples = {txt(r.cnpj_basico): (sim(r.s), sim(r.m)) for r in consulta(
+        bq, f"SELECT cnpj_basico, {cs} AS s, {cm} AS m FROM `{t}` WHERE {filtro} AND cnpj_basico IN UNNEST(@b)", [p_b])}
 
-    # 5. Sócios (primeiro sócio pessoa física/administrador encontrado)
     socios = {}
     if BAIXAR_SOCIOS:
-        for nome in grupo("socios"):
-            caminho = baixar_fn(mes, nome)
-            for l in linhas(caminho):
-                if len(l) >= 3 and l[0] in basicos and l[0] not in socios and l[2].strip():
-                    socios[l[0]] = l[2].strip().title()
-            os.remove(caminho)
-    return estab, empresas, simples, socios, cnaes
+        ETAPA = "sócios"
+        try:
+            t = f"{DS}.socios"
+            c = colunas(bq, t)
+            filtro, _ = ultimo_periodo(bq, t, c)
+            cn = escolher(c, ["nome", "nome_socio"], t)
+            for r in consulta(bq, f"SELECT cnpj_basico, {cn} AS nome FROM `{t}` "
+                                  f"WHERE {filtro} AND cnpj_basico IN UNNEST(@b)", [p_b]):
+                socios.setdefault(txt(r.cnpj_basico), txt(r.nome).title())
+        except Exception as e:
+            log("Sócios ficaram de fora:", e)
+
+    cnaes = {}
+    try:
+        for r in consulta(bq, "SELECT subclasse, descricao_subclasse FROM `basedosdados.br_bd_diretorios_brasil.cnae_2`"):
+            cnaes["".join(ch for ch in txt(r.subclasse) if ch.isdigit())] = txt(r.descricao_subclasse)
+    except Exception as e:
+        log("Descrições de CNAE ficaram de fora:", e)
+    return periodo, estab, empresas, simples, socios, cnaes
 
 
 def idade(data_inicio):
@@ -258,7 +265,7 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
             emp = empresas.get(cnpj[:8], [])
             porte = emp[5] if len(emp) > 5 else ""
             try:
-                capital = float((emp[4] if len(emp) > 4 else "0").replace(".", "").replace(",", "."))
+                capital = float(emp[4] if len(emp) > 4 else "0")
             except ValueError:
                 capital = 0.0
             e_simples, e_mei = simples.get(cnpj[:8], (False, False))
@@ -320,22 +327,19 @@ def avisar(msg):
 
 def main():
     global ETAPA
-    avisar("⏳ Radar Tributário: comecei a baixar a base da Receita. Pode levar até 3 horas.")
-    ETAPA = "listagem de arquivos da Receita"
-    mes, arqs = ultimo_mes_e_arquivos()
-    log("Base da Receita:", mes, "com", len(arqs), "arquivos")
-    estab, empresas, simples, socios, cnaes = processar(mes, arqs)
+    periodo, estab, empresas, simples, socios, cnaes = buscar()
     ETAPA = "montagem da planilha"
-    saida = f"empresas-{mes}.csv"
+    saida = f"empresas-{periodo}.csv"
     total = montar_csv(estab, empresas, simples, socios, cnaes, saida)
     log("Empresas no CSV:", total)
-    enviar_telegram(saida, f"📊 Radar Tributário · base {mes} · {total} empresas em "
-                           f"{', '.join(c.title() for c in CIDADES)}. Importe este arquivo no painel.")
+    enviar_telegram(saida, f"📊 Radar Tributário · base {periodo} · {total} empresas em "
+                           f"{', '.join(CIDADES)}. Importe este arquivo no painel.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        avisar_erro(f"parou na etapa \"{ETAPA}\": {e}")
+        avisar(f"⚠️ Radar Tributário: parou na etapa \"{ETAPA}\": {str(e)[:3000]}")
         raise
+
