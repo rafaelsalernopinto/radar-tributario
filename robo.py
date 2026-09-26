@@ -58,16 +58,59 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+ETAPA = "início"
+ARQUIVOS_PADRAO = (["Cnaes.zip", "Municipios.zip", "Simples.zip"]
+                   + [f"{p}{i}.zip" for p in ("Empresas", "Estabelecimentos", "Socios") for i in range(10)])
+
+
+def propfind(url):
+    for tentativa in range(6):
+        try:
+            r = requests.request("PROPFIND", url, auth=(SHARE_TOKEN, ""),
+                                 headers={"Depth": "1", **HEADERS}, timeout=90)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            log(f"  listagem falhou ({e}); tentativa {tentativa + 1}")
+            time.sleep(20 * (tentativa + 1))
+    raise RuntimeError("a Receita não respondeu à listagem de arquivos")
+
+
+def mes_sem_listagem():
+    """Plano B: tenta o mês atual e os dois anteriores, sem listar a pasta."""
+    hoje = date.today()
+    for volta in range(3):
+        a, m = hoje.year, hoje.month - volta
+        while m <= 0:
+            a, m = a - 1, m + 12
+        mes = f"{a}-{m:02d}"
+        try:
+            r = requests.get(FILES % (SHARE_TOKEN, mes, "Cnaes.zip"), headers=HEADERS,
+                             stream=True, timeout=(30, 90))
+            if r.ok:
+                r.close()
+                return mes, list(ARQUIVOS_PADRAO)
+        except Exception as e:
+            log(f"  teste do mês {mes} falhou ({e})")
+    raise RuntimeError("não encontrei a pasta do mês na Receita")
+
+
 def ultimo_mes_e_arquivos():
+    try:
+        return _ultimo_mes_e_arquivos()
+    except Exception as e:
+        log("Listagem falhou, usando plano B:", e)
+        return mes_sem_listagem()
+
+
+def _ultimo_mes_e_arquivos():
     ns = {"d": "DAV:"}
-    r = requests.request("PROPFIND", DAV, auth=(SHARE_TOKEN, ""), headers={"Depth": "1"}, timeout=60)
-    r.raise_for_status()
+    r = propfind(DAV)
     meses = sorted(re.search(r"(\d{4}-\d{2})/?$", e.find("d:href", ns).text).group(1)
                    for e in ElementTree.fromstring(r.content).findall("d:response", ns)
                    if re.search(r"(\d{4}-\d{2})/?$", e.find("d:href", ns).text))
     mes = meses[-1]
-    r = requests.request("PROPFIND", DAV + mes + "/", auth=(SHARE_TOKEN, ""), headers={"Depth": "1"}, timeout=60)
-    r.raise_for_status()
+    r = propfind(DAV + mes + "/")
     arqs = [re.search(r"/([^/]+\.zip)$", e.find("d:href", ns).text, re.I).group(1)
             for e in ElementTree.fromstring(r.content).findall("d:response", ns)
             if re.search(r"/([^/]+\.zip)$", e.find("d:href", ns).text, re.I)]
@@ -75,10 +118,12 @@ def ultimo_mes_e_arquivos():
 
 
 def baixar(mes, nome):
+    global ETAPA
+    ETAPA = f"download de {nome}"
     os.makedirs(PASTA, exist_ok=True)
     destino = os.path.join(PASTA, nome)
     url = FILES % (SHARE_TOKEN, mes, nome)
-    for tentativa in range(5):
+    for tentativa in range(8):
         try:
             with requests.get(url, headers=HEADERS, stream=True, timeout=(30, 300)) as r:
                 r.raise_for_status()
@@ -89,7 +134,7 @@ def baixar(mes, nome):
             return destino
         except Exception as e:
             log(f"  falha ao baixar {nome} ({e}); tentando de novo")
-            time.sleep(15 * (tentativa + 1))
+            time.sleep(min(30 * (tentativa + 1), 180))
     raise RuntimeError(f"Não consegui baixar {nome}")
 
 
@@ -264,10 +309,23 @@ def avisar_erro(msg):
         pass
 
 
+def avisar(msg):
+    try:
+        token, chat = os.environ["TELEGRAM_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data={"chat_id": chat, "text": msg}, timeout=30)
+    except Exception:
+        pass
+
+
 def main():
+    global ETAPA
+    avisar("⏳ Radar Tributário: comecei a baixar a base da Receita. Pode levar até 3 horas.")
+    ETAPA = "listagem de arquivos da Receita"
     mes, arqs = ultimo_mes_e_arquivos()
     log("Base da Receita:", mes, "com", len(arqs), "arquivos")
     estab, empresas, simples, socios, cnaes = processar(mes, arqs)
+    ETAPA = "montagem da planilha"
     saida = f"empresas-{mes}.csv"
     total = montar_csv(estab, empresas, simples, socios, cnaes, saida)
     log("Empresas no CSV:", total)
@@ -279,5 +337,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        avisar_erro(str(e))
+        avisar_erro(f"parou na etapa \"{ETAPA}\": {e}")
         raise
