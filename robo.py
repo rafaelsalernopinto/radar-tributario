@@ -19,7 +19,8 @@ from google.oauth2 import service_account
 CIDADES = ["Votuporanga"]          # nomes das cidades, como no IBGE
 UF = "SP"
 IDADE_MINIMA_ANOS = 2
-BAIXAR_SOCIOS = True               # False deixa o robô mais rápido, sem nome do sócio
+BAIXAR_SOCIOS = True
+SO_MATRIZ = True                   # ignora filiais de redes de fora (ex.: lojas de rede nacional)               # False deixa o robô mais rápido, sem nome do sócio
 
 # Força por CNAE em cada tese: A = Alta, M = Média, B = Baixa, R = revisão manual
 TESE1_ICMS_ST = {  # fora do Simples
@@ -46,6 +47,7 @@ TESE4_ISS = {  # fora do Simples; tese aguardando STF
 
 PONTOS_FORCA = {"A": 40, "M": 25, "B": 10, "R": 10}
 _NOMES = {}
+BASE = ""
 ETAPA = "início"
 DS = "basedosdados.br_me_cnpj"
 LIMITE_BYTES = 300 * 10**9   # trava de segurança por consulta (bem abaixo do 1 TB grátis)
@@ -128,7 +130,8 @@ def buscar():
         ("logradouro", ["logradouro"], False), ("numero", ["numero"], False), ("bairro", ["bairro"], False),
         ("cep", ["cep"], False), ("ddd1", ["ddd_1", "ddd1"], False), ("tel1", ["telefone_1", "telefone1"], False),
         ("ddd2", ["ddd_2", "ddd2"], False), ("tel2", ["telefone_2", "telefone2"], False),
-        ("email", ["email"], False), ("municipio", ["id_municipio"], True), ("uf", ["sigla_uf"], True)]}
+        ("email", ["email"], False), ("municipio", ["id_municipio"], True), ("uf", ["sigla_uf"], True),
+        ("matriz", ["identificador_matriz_filial"], False)]}
     sel = ", ".join(f"{v} AS {k}" for k, v in campos.items() if v)
     linhas = consulta(bq, f"SELECT {sel} FROM `{t}` WHERE {filtro} AND {campos['uf']} = @uf "
                           f"AND CAST({campos['municipio']} AS STRING) IN UNNEST(@ids)",
@@ -140,6 +143,9 @@ def buscar():
         situ = g("situacao").upper()
         if zeros(situ) != "2" and "ATIVA" not in situ:
             continue
+        tipo_estab = g("matriz").upper()
+        if SO_MATRIZ and tipo_estab and zeros(tipo_estab) != "1" and "MATRIZ" not in tipo_estab:
+            continue  # filial: quem decide fica na matriz
         cnpj = "".join(ch for ch in g("cnpj") if ch.isdigit()).zfill(14)
         l = [""] * 30
         l[0], l[1], l[2] = cnpj[:8], cnpj[8:12], cnpj[12:]
@@ -256,7 +262,7 @@ def pontuar(teses, anos, capital, porte):
 def montar_csv(estab, empresas, simples, socios, cnaes, saida):
     campos = ["cnpj", "razao_social", "nome_fantasia", "municipio", "uf", "bairro", "logradouro",
               "numero", "cep", "telefone1", "telefone2", "email", "cnae_principal", "cnae_descricao",
-              "data_inicio", "capital_social", "socio_principal", "teses", "prioridade", "pontuacao"]
+              "data_inicio", "capital_social", "socio_principal", "teses", "prioridade", "pontuacao", "base"]
     total = 0
     with open(saida, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=campos)
@@ -287,7 +293,7 @@ def montar_csv(estab, empresas, simples, socios, cnaes, saida):
                 "cnae_descricao": cnaes.get(l[11], ""),
                 "data_inicio": f"{l[10][:4]}-{l[10][4:6]}-{l[10][6:8]}" if len(l[10]) == 8 else "",
                 "capital_social": f"{capital:.2f}", "socio_principal": socios.get(cnpj[:8], ""),
-                "teses": "|".join(t for t, _, _ in teses), "prioridade": prioridade, "pontuacao": pontos,
+                "teses": "|".join(t for t, _, _ in teses), "prioridade": prioridade, "pontuacao": pontos, "base": BASE,
             })
             total += 1
     return total
@@ -326,8 +332,9 @@ def avisar(msg):
 
 
 def main():
-    global ETAPA
+    global ETAPA, BASE
     periodo, estab, empresas, simples, socios, cnaes = buscar()
+    BASE = periodo
     ETAPA = "montagem da planilha"
     saida = f"empresas-{periodo}.csv"
     total = montar_csv(estab, empresas, simples, socios, cnaes, saida)
